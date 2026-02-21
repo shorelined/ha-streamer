@@ -1,7 +1,8 @@
 # Hearing Aid Streamer
 Stream audio from your PC to hearing aid via iPhone / Android
 
-<img src="images/demo.png" width="400">
+<img src="images/demo.png" width="300">
+
 ![App Screenshot](images/app.png)
 
 ## How to install
