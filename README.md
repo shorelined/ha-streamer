@@ -1,6 +1,9 @@
 # Hearing Aid Streamer
 Stream audio from your PC to hearing aid via iPhone / Android
 
+![Demo Screenshot](images/demo.png)
+![App Screenshot](images/app.png)
+
 ## How to install
 Download the app in [Releases](https://github.com/shorelined/ha-streamer/releases) tab
 
