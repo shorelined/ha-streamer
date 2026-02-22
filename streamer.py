@@ -7,8 +7,11 @@ import threading
 import logging
 import click
 import queue
+import webbrowser
 import simple_websocket
 import pyaudiowpatch as pyaudio
+import tkinter as tk
+from tkinter import font as tkfont
 from array import array
 from flask import Flask, render_template_string
 from flask_sock import Sock
@@ -28,8 +31,40 @@ sock = Sock(app)
 
 clients: list[queue.Queue[bytes]] = []
 clients_lock = threading.Lock()
+client_limit: int | None = 1
 device_info = {}
 device_ready = threading.Event()
+
+# Catpuccin Mocha colorscheme
+class Color:
+    rosewater = '#f5e0dc'
+    flamingo  = '#f2cdcd'
+    pink      = '#f5c2e7'
+    mauve     = '#cba6f7'
+    red       = '#f38ba8'
+    maroon    = '#eba0ac'
+    peach     = '#fab387'
+    yellow    = '#f9e2af'
+    green     = '#a6e3a1'
+    teal      = '#94e2d5'
+    sky       = '#89dceb'
+    sapphire  = '#74c7ec'
+    blue      = '#89b4fa'
+    lavender  = '#b4befe'
+    text      = '#cdd6f4'
+    subtext1  = '#bac2de'
+    subtext0  = '#a6adc8'
+    overlay2  = '#9399b2'
+    overlay1  = '#7f849c'
+    overlay0  = '#6c7086'
+    surface2  = '#585b70'
+    surface1  = '#45475a'
+    surface0  = '#313244'
+    base      = '#1e1e2e'
+    mantle    = '#181825'
+    crust     = '#11111b'
+
+log_queue: queue.Queue = queue.Queue()
 
 def build_sparse_dither_silence(frames: int, channels: int, period_frames: int, lsb: int) -> bytes:
     if frames <= 0 or channels <= 0 or period_frames <= 0 or lsb <= 0:
@@ -249,7 +284,7 @@ HTML_PAGE = """
 <body>
     <main class="panel">
         <header>
-            <h1>PC Audio Stream</h1>
+            <h1>HA/CI Audio Streamer</h1>
             <span class="pill" id="status">Tap Play</span>
         </header>
 
@@ -647,6 +682,9 @@ def audio_ws(ws):
     )
 
     with clients_lock:
+        if client_limit is not None and len(clients) >= client_limit:
+            ws.close()
+            return
         clients.append(q)
 
     try:
@@ -872,23 +910,330 @@ def get_network_info():
             ip = info[4][0]
             if not ip.startswith("127."):
                 interfaces.append(("Network", ip))
+    interfaces.sort(key=lambda x: 0 if x[0] == 'Hotspot' else 1)
     return interfaces
 
+class Tee:
+    def __init__(self, orig, lvl: str):
+        self._orig, self._lvl, self._buf = orig, lvl, ''
+
+    def write(self, s: str) -> int:
+        self._orig.write(s)
+        self._buf += s
+        while '\n' in self._buf:
+            line, self._buf = self._buf.split('\n', 1)
+            log_queue.put((self._lvl, line))
+        return len(s)
+
+    def flush(self):
+        self._orig.flush()
+        if self._buf.strip():
+            log_queue.put((self._lvl, self._buf.strip()))
+            self._buf = ''
+
+    def __getattr__(self, n):
+        return getattr(self._orig, n)
+
+class MinimalScrollbar(tk.Canvas):
+    """Thin canvas scrollbar — no arrows, flat thumb."""
+    def __init__(self, parent, command=None, **kw):
+        kw.setdefault('width', 6)
+        kw.setdefault('bg', Color.mantle)
+        super().__init__(parent, highlightthickness=0, bd=0, **kw)
+        self.command = command
+        self.top = 0.0
+        self.bot = 1.0
+        self.drag_y = None
+        self.create_rectangle(0, 0, 0, 0, fill=Color.surface2, outline='', tags='thumb')
+        self.bind('<Configure>',      lambda _: self.redraw())
+        self.bind('<ButtonPress-1>',  self.on_press)
+        self.bind('<B1-Motion>',      self.on_drag)
+        self.bind('<Enter>', lambda _: self.itemconfig('thumb', fill=Color.overlay0))
+        self.bind('<Leave>', lambda _: self.itemconfig('thumb', fill=Color.surface2))
+
+    def set(self, top, bottom):
+        self.top, self.bot = float(top), float(bottom)
+        self.redraw()
+
+    def redraw(self):
+        h = self.winfo_height()
+        if h < 2:
+            return
+        w = self.winfo_width()
+        y0 = int(h * self.top)
+        y1 = max(int(h * self.bot), y0 + 20)
+        self.coords('thumb', 1, y0, w - 1, y1)
+
+    def on_press(self, e):
+        self.drag_y = e.y
+        if self.command:
+            span = self.bot - self.top
+            self.command('moveto', e.y / self.winfo_height() - span / 2)
+
+    def on_drag(self, e):
+        if self.drag_y is None:
+            return
+        delta = (e.y - self.drag_y) / self.winfo_height()
+        self.drag_y = e.y
+        if self.command:
+            self.command('moveto', self.top + delta)
+
+class StreamerApp:
+    pad = 14  # outer window padding
+
+    def __init__(self, root: "tk.Tk", port: int):
+        self.root, self.port = root, port
+        self.ifaces: list = []
+        self.ifaces_displayed: list = []
+        self.err: str | None = None
+        self.init_window()
+        self.build_ui()
+        self.start_backend()
+        self.poll()
+
+    def init_window(self):
+        self.root.title('HA/CI Audio Streamer')
+        self.root.configure(bg=Color.base)
+        self.root.resizable(True, True)
+        self.root.minsize(420, 480)
+        try:
+            self.root.iconbitmap('icon.ico')
+        except Exception:
+            pass
+        w, h = 480, 600
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.root.geometry(f'{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}')
+        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+
+    def build_ui(self):
+        self.f = {
+            'title': tkfont.Font(family='Segoe UI', size=14, weight='bold'),
+            'sec':   tkfont.Font(family='Segoe UI', size=8,  weight='bold'),
+            'body':  tkfont.Font(family='Segoe UI', size=10),
+            'big':   tkfont.Font(family='Segoe UI', size=14, weight='bold'),
+            'mono':  tkfont.Font(family='Consolas',  size=9),
+            'small': tkfont.Font(family='Segoe UI', size=10),
+        }
+
+        # Header
+        hdr = tk.Frame(self.root, bg=Color.base)
+        hdr.pack(fill='x', padx=self.pad, pady=(self.pad + 2, 4))
+
+        tk.Label(hdr, text='HA/CI Audio Streamer', fg=Color.mauve, bg=Color.base, font=self.f['title']).pack(side='left')
+        
+        self.dot   = tk.Label(hdr, text='●', fg=Color.yellow, bg=Color.base, font=self.f['small'])
+        self.sttxt = tk.Label(hdr, text='Starting…', fg=Color.yellow, bg=Color.base, font=self.f['small'])
+        self.dot.pack(side='right', padx=(4, 0))
+        self.sttxt.pack(side='right')
+
+        # Divider
+        tk.Frame(self.root, bg=Color.surface0, height=1).pack(fill='x', padx=self.pad, pady=(2, 6))
+
+        # Audio device card
+        ci = self.card()
+        self.sec(ci, 'AUDIO DEVICE')
+        self.lout  = self.row(ci, Color.text)
+        self.lloop = self.row(ci, Color.subtext0)
+        self.lfmt  = self.row(ci, Color.overlay2, font=self.f['mono'])
+
+        # Connected clients card
+        ci = self.card()
+
+        hdr = tk.Frame(ci, bg=Color.mantle)
+        hdr.pack(fill='x', pady=(0, 6))
+        tk.Label(hdr, text='CONNECTED CLIENTS', fg=Color.overlay2, bg=Color.mantle, font=self.f['sec'], anchor='w').pack(side='left')
+
+        self.limit_val = 1
+        lim_frame = tk.Frame(hdr, bg=Color.mantle)
+        lim_frame.pack(side='right', anchor='center')
+        tk.Label(lim_frame, text='limit:', fg=Color.overlay1, bg=Color.mantle, font=self.f['sec']).pack(side='left')
+        self.llim = tk.Label(lim_frame, text='1', fg=Color.subtext0, bg=Color.mantle, font=self.f['sec'], width=3, anchor='e')
+        self.llim.pack(side='left')
+        btn_kw = dict(bg=Color.surface0, fg=Color.subtext1, activebackground=Color.surface1, activeforeground=Color.text,
+                      relief='flat', bd=0, cursor='hand2', font=self.f['sec'], padx=3, pady=0)
+        tk.Button(lim_frame, text='▲', command=self.limit_up,   **btn_kw).pack(side='left', padx=(4, 1))
+        tk.Button(lim_frame, text='▼', command=self.limit_down, **btn_kw).pack(side='left', padx=(1, 0))
+
+        self.lcli = tk.Label(ci, text='0', fg=Color.mauve, bg=Color.mantle, font=self.f['big'], anchor='w')
+        self.lcli.pack(fill='x', pady=(0, 2))
+
+        # Network URLs card
+        ci = self.card()
+        self.sec(ci, 'CONNECT FROM YOUR PHONE')
+        self.net_f = tk.Frame(ci, bg=Color.mantle)
+        self.net_f.pack(fill='x')
+
+        # Log card (expands to fill remaining space)
+        ci = self.card(expand=True)
+        self.sec(ci, 'LOG')
+        wrap = tk.Frame(ci, bg=Color.crust)
+        wrap.pack(fill='both', expand=True)
+        self.log = tk.Text(
+            wrap, bg=Color.crust, fg=Color.subtext0,
+            font=self.f['mono'], relief='flat', bd=0,
+            state='disabled', wrap='word',
+            padx=8, pady=5, cursor='arrow',
+            selectbackground=Color.surface1, selectforeground=Color.text,
+        )
+        self.log.tag_configure('info',  foreground=Color.subtext0)
+        self.log.tag_configure('error', foreground=Color.red)
+        vsb = MinimalScrollbar(wrap, command=self.log.yview, bg=Color.crust)
+        self.log.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        self.log.pack(side='left', fill='both', expand=True)
+
+    def card(self, expand: bool = False) -> "tk.Frame":
+        outer = tk.Frame(self.root, bg=Color.mantle)
+        outer.pack(fill='both' if expand else 'x', expand=expand, padx=self.pad, pady=(0, self.pad if expand else 6))
+
+        inner = tk.Frame(outer, bg=Color.mantle)
+        inner.pack(fill='both', expand=expand, padx=12, pady=8)
+
+        return inner
+
+    def sec(self, parent: "tk.Frame", text: str):
+        tk.Label(parent, text=text, fg=Color.overlay2, bg=Color.mantle, font=self.f['sec'], anchor='w').pack(fill='x', pady=(0, 6))
+
+    def row(self, parent: "tk.Frame", fg: str, font=None) -> "tk.Label":
+        lbl = tk.Label(parent, text='', fg=fg, bg=Color.mantle, font=font or self.f['body'], anchor='w')
+        lbl.pack(fill='x', pady=1)
+        return lbl
+
+    def start_backend(self):
+        sys.stdout = Tee(sys.__stdout__, 'info')
+        sys.stderr = Tee(sys.__stderr__, 'error')
+        threading.Thread(target=self.run_capture, daemon=True).start()
+        threading.Thread(target=self.run_flask,   daemon=True).start()
+        self.refresh_ifaces()
+
+    def run_capture(self):
+        try:
+            audio_capture()
+        except SystemExit as e:
+            self.err = f'Audio init failed (exit {e.code})'
+        except Exception as e:
+            self.err = str(e)
+
+    def refresh_ifaces(self):
+        """Fetch network interfaces in background; reschedule every second."""
+        def fetch():
+            self.ifaces = get_network_info()
+        threading.Thread(target=fetch, daemon=True).start()
+        self.root.after(1000, self.refresh_ifaces)
+
+    def run_flask(self):
+        for _ in range(10):
+            try:
+                app.run(host='0.0.0.0', port=self.port, threaded=True, use_reloader=False, debug=False)
+                return
+            except (SystemExit, KeyboardInterrupt):
+                return
+            except OSError:
+                self.port += 1
+                self.ifaces_displayed = []  # force network card rebuild with new port
+            except Exception as e:
+                self.err = str(e)
+                return
+        self.err = 'No available port found'
+
+    def poll(self):
+        # Status indicator
+        if self.err:
+            c, t = Color.red, 'Error'
+        elif device_ready.is_set():
+            c, t = Color.green, 'Running'
+        else:
+            c, t = Color.yellow, 'Starting…'
+        self.dot.configure(fg=c)
+        self.sttxt.configure(text=t, fg=c)
+
+        # Audio device labels
+        d   = device_info
+        out = d.get('default_output_device', '')
+        if out:
+            def trunc(s: str, n: int = 44) -> str:
+                return s if len(s) <= n else s[:n - 1] + '…'
+            self.lout.configure( text='Output   ' + trunc(out))
+            self.lloop.configure(text='Capture  ' + trunc(d.get('loopback_device', ''), 42))
+            sr, ch = d.get('sample_rate', ''), d.get('channels', '')
+            self.lfmt.configure(text=f'{ch}ch  @  {sr} Hz' if sr else '')
+        elif not self.err:
+            self.lout.configure( text='Detecting audio device…')
+            self.lloop.configure(text='')
+            self.lfmt.configure( text='')
+
+        # Connected client count
+        with clients_lock:
+            n = len(clients)
+        self.lcli.configure(text=str(n), fg=Color.green if n else Color.mauve)
+
+        # Network URLs — rebuild whenever the interface list changes
+        if self.ifaces != self.ifaces_displayed:
+            self.ifaces_displayed = list(self.ifaces)
+            for w in self.net_f.winfo_children():
+                w.destroy()
+            for name, ip in self.ifaces_displayed:
+                url = f'http://{ip}:{self.port}'
+                row = tk.Frame(self.net_f, bg=Color.mantle)
+                row.pack(fill='x', pady=2)
+
+                tk.Label(row, text=f'{name}:', fg=Color.overlay2, bg=Color.mantle, font=self.f['body'], width=16, anchor='w').pack(side='left')
+                
+                lnk = tk.Label(row, text=url, fg=Color.blue, bg=Color.mantle, font=self.f['mono'], cursor='hand2', anchor='w')
+                lnk.pack(side='left')
+                lnk.bind('<Button-1>', lambda _, u=url: webbrowser.open(u))
+                lnk.bind('<Enter>',    lambda _, l=lnk: l.configure(fg=Color.sapphire))
+                lnk.bind('<Leave>',    lambda _, l=lnk: l.configure(fg=Color.blue))
+
+                cpb = tk.Label(row, text='  ⧉', fg=Color.overlay0, bg=Color.mantle, font=self.f['body'], cursor='hand2')
+                cpb.pack(side='left')
+                cpb.bind('<Button-1>', lambda _, u=url: self.copy(u))
+                cpb.bind('<Enter>',    lambda _, b=cpb: b.configure(fg=Color.subtext1))
+                cpb.bind('<Leave>',    lambda _, b=cpb: b.configure(fg=Color.overlay0))
+
+        # Drain log queue
+        entries = []
+        try:
+            while True:
+                entries.append(log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if entries:
+            self.log.configure(state='normal')
+            for lvl, line in entries:
+                self.log.insert('end', line + '\n', lvl)
+            self.log.configure(state='disabled')
+            self.log.see('end')
+
+        self.root.after(500, self.poll)
+
+    def limit_up(self):
+        global client_limit
+        self.limit_val = min(self.limit_val + 1, 99) if self.limit_val > 0 else 1
+        client_limit = self.limit_val
+        self.llim.configure(text=str(self.limit_val))
+
+    def limit_down(self):
+        global client_limit
+        if self.limit_val <= 0:
+            return
+        self.limit_val -= 1
+        client_limit = self.limit_val if self.limit_val > 0 else None
+        self.llim.configure(text='∞' if self.limit_val == 0 else str(self.limit_val))
+
+    def copy(self, text: str):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def on_close(self):
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        self.root.destroy()
+
 def main():
-    parser = argparse.ArgumentParser(description="Stream PC audio to LAN")
-    parser.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
-    args = parser.parse_args()
-    
-    capture_thread = threading.Thread(target=audio_capture, daemon=True)
-    capture_thread.start()
-
-    interfaces = get_network_info()
-    print(f"\nOpen on your phone:")
-    for name, ip in interfaces:
-        print(f"  {name}: http://{ip}:{args.port}")
-    print()
-
-    app.run(host="0.0.0.0", port=args.port, threaded=True)
+    root = tk.Tk()
+    StreamerApp(root, port=8000)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
