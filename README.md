@@ -24,7 +24,7 @@ Tested on Python 3.12
 ## Setup
 It's recommended to use USB Tethering over Wi-Fi (for low-latency). If you have an iPhone you have to download and connect to [iTunes](https://www.apple.com/itunes/) for USB Tethering to work. 
 
-After connecting your iPhone / Android with USB Tethering, Run the app and open the <IP:Port> from "Hotspot: <IP:Port>" in your phone browser. Or if youre using Wi-Fi just connect to the network youre using (ie. WiFi, Ethernet)
+After connecting your iPhone / Android with USB Tethering, Run the app and open the http://IP:Port from "Hotspot: http://IP:Port" in your phone browser. Or if youre using Wi-Fi just connect to the network youre using (ie. WiFi, Ethernet)
 
 Buffer target is automatically adjusted if you get buffer underruns, so its better to leave it as is. Unless youre using Wi-Fi / Hotspot, in which case you should crank it to 400-500ms depending on your network quality.
 
