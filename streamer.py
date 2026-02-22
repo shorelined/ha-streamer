@@ -862,6 +862,12 @@ def audio_capture():
         stream.close()
         p.terminate()
 
+def run_hidden(cmd, **kwargs):
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return subprocess.run(cmd, startupinfo=si, creationflags=subprocess.CREATE_NO_WINDOW, **kwargs)
+
 # get all local IPs with interface info
 def get_network_info():
     interfaces = []
@@ -869,17 +875,17 @@ def get_network_info():
 
     # get WiFi SSID
     try:
-        result = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, timeout=5)
+        result = run_hidden(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.split("\n"):
             if "SSID" in line and "BSSID" not in line:
                 ssid = line.split(":", 1)[1].strip()
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'netsh failed: {e}', file=sys.stderr)
 
     # parse ipconfig to get adapter names and IPs
     try:
-        result = subprocess.run(["ipconfig"], capture_output=True, text=True, timeout=5)
+        result = run_hidden(["ipconfig"], capture_output=True, text=True, timeout=5)
         current_adapter = ""
 
         for line in result.stdout.split("\n"):
@@ -904,7 +910,8 @@ def get_network_info():
                 else:
                     name = "LAN"
                 interfaces.append((name, ip))
-    except Exception:
+    except Exception as e:
+        print(f'ipconfig failed: {e}', file=sys.stderr)
         # fallback to basic method
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
@@ -915,24 +922,32 @@ def get_network_info():
 
 class Tee:
     def __init__(self, orig, lvl: str):
-        self._orig, self._lvl, self._buf = orig, lvl, ''
+        self.orig, self.lvl, self.buf = orig, lvl, ''
 
     def write(self, s: str) -> int:
-        self._orig.write(s)
-        self._buf += s
-        while '\n' in self._buf:
-            line, self._buf = self._buf.split('\n', 1)
-            log_queue.put((self._lvl, line))
+        try:
+            if self.orig is not None:
+                self.orig.write(s)
+        except Exception:
+            pass
+        self.buf += s
+        while '\n' in self.buf:
+            line, self.buf = self.buf.split('\n', 1)
+            log_queue.put((self.lvl, line))
         return len(s)
 
     def flush(self):
-        self._orig.flush()
-        if self._buf.strip():
-            log_queue.put((self._lvl, self._buf.strip()))
-            self._buf = ''
+        try:
+            if self.orig is not None:
+                self.orig.flush()
+        except Exception:
+            pass
+        if self.buf.strip():
+            log_queue.put((self.lvl, self.buf.strip()))
+            self.buf = ''
 
     def __getattr__(self, n):
-        return getattr(self._orig, n)
+        return getattr(self.orig, n)
 
 class MinimalScrollbar(tk.Canvas):
     """Thin canvas scrollbar — no arrows, flat thumb."""
@@ -1111,15 +1126,17 @@ class StreamerApp:
             audio_capture()
         except SystemExit as e:
             self.err = f'Audio init failed (exit {e.code})'
+            log_queue.put(('error', self.err))
         except Exception as e:
             self.err = str(e)
+            log_queue.put(('error', f'Capture error: {e}'))
 
     def refresh_ifaces(self):
         """Fetch network interfaces in background; reschedule every second."""
         def fetch():
             self.ifaces = get_network_info()
         threading.Thread(target=fetch, daemon=True).start()
-        self.root.after(1000, self.refresh_ifaces)
+        self.root.after(5000, self.refresh_ifaces)
 
     def run_flask(self):
         for _ in range(10):
@@ -1133,8 +1150,10 @@ class StreamerApp:
                 self.ifaces_displayed = []  # force network card rebuild with new port
             except Exception as e:
                 self.err = str(e)
+                log_queue.put(('error', f'Flask error: {e}'))
                 return
         self.err = 'No available port found'
+        log_queue.put(('error', self.err))
 
     def poll(self):
         # Status indicator
